@@ -1,4 +1,4 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0f1117"><script src="config.js"></script><script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <title>魔晶地牢</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap">
@@ -6982,6 +6982,760 @@ choosePerk=function(i){
   if(q.id==='xtough'){recalc();p.hp=Math.min(p.maxhp,p.hp+3);}
   if(q.id==='xeng'){recalc();p.energy=Math.min(p.maxenergy,p.energy+30);}
 };
+/* =====================================================================
+   v18: anti-stuck system, 25 new map layouts, 8 special scenes with
+   hazards, 11 new facility/event rooms, free-bet gambling.
+   ===================================================================== */
+
+/* ---------- 1. anti-stuck (monsters / drops / chests / player) ---------- */
+function findFree(x,y,r,fly,avoid,gap){
+  r=r||8;gap=gap||34;
+  const far=a=>avoid&&avoid.some(o=>Math.hypot(o.x-a[0],o.y-a[1])<gap);
+  if(!blocked(x,y,r,fly)&&!far([x,y]))return [x,y];
+  const c0=Math.max(1,Math.min(COLS-2,Math.floor(x/T))),r0=Math.max(1,Math.min(ROWS-2,Math.floor(y/T)));
+  for(const useReach of [true,false]){
+    for(let rad=0;rad<=11;rad++){
+      let best=null,bd=1e9;
+      for(let dr=-rad;dr<=rad;dr++)for(let dc=-rad;dc<=rad;dc++){
+        if(Math.max(Math.abs(dr),Math.abs(dc))!==rad)continue;
+        const c=c0+dc,rr=r0+dr;
+        if(c<1||rr<1||c>COLS-2||rr>ROWS-2)continue;
+        if(G.grid[rr][c]!==0)continue;
+        if(useReach&&G.reach&&!G.reach.has(rr*COLS+c))continue;
+        const a=[c*T+T/2,rr*T+T/2];
+        if(blocked(a[0],a[1],r,fly)||far(a))continue;
+        const d=Math.hypot(a[0]-x,a[1]-y);
+        if(d<bd){bd=d;best=a;}
+      }
+      if(best)return best;
+    }
+  }
+  return null;
+}
+function unstickAll(){
+  if(!G||!G.grid||G.state==='over')return 0;
+  let n=0;
+  const fix=(o,r,fly)=>{
+    if(!o||typeof o.x!=='number'||typeof o.y!=='number')return;
+    if(!blocked(o.x,o.y,2,fly))return;
+    const f=findFree(o.x,o.y,r,fly);
+    if(f){o.x=f[0];o.y=f[1];if(o.vx!==undefined){o.vx=0;o.vy=0;}if(o.kx!==undefined){o.kx=0;o.ky=0;}n++;}
+  };
+  const p=G.player;
+  if(p&&!p.down)fix(p,p.r||10,false);
+  for(const e of G.enemies)if(!e.dead&&!e.ghost)fix(e,Math.min(e.cr||e.r||10,14),!!(e.d&&e.d.fly));
+  for(const k of G.pick)fix(k,4,false);
+  for(const a of G.allies)fix(a,a.r||8,false);
+  if(G.portal)fix(G.portal,10,false);
+  const placed=[];
+  for(const pr of G.props){
+    if(typeof pr.x==='number'&&blocked(pr.x,pr.y,2,false)){
+      const f=findFree(pr.x,pr.y,12,false,placed.concat(G.pick.filter(k=>k.shop)),46);
+      if(f){pr.x=f[0];pr.y=f[1];n++;}
+    }
+    placed.push(pr);
+  }
+  return n;
+}
+const xMoveEnt=moveEnt;
+moveEnt=function(e,dx,dy,fly){
+  const r=e.cr||e.r||6;
+  if(e.ghost){e.x=clamp(e.x+dx,14,W-14);e.y=clamp(e.y+dy,T+10,H-T-10);return;}
+  /* 身體與牆輕微重疊時改用較細的判定，確保一定能滑出來而不是兩軸都被擋死 */
+  const rr=blocked(e.x,e.y,r,fly)?Math.max(2,r*.3):r;
+  if(!blocked(e.x+dx,e.y,rr,fly))e.x+=dx;
+  if(!blocked(e.x,e.y+dy,rr,fly))e.y+=dy;
+};
+const xDropPick=dropPick;
+dropPick=function(type,x,y,extra){
+  if(G&&G.grid&&blocked(x,y,2,false)){const f=findFree(x,y,4,false);if(f){x=f[0];y=f[1];}}
+  return xDropPick(type,x,y,extra);
+};
+
+/* ---------- 2. new map layouts ---------- */
+const NEWPAT={};
+const rectW=(g,c1,r1,c2,r2,v,gaps)=>{for(let c=c1;c<=c2;c++)for(let r=r1;r<=r2;r++){if(c!==c1&&c!==c2&&r!==r1&&r!==r2)continue;if(gaps&&gaps.some(q=>q[0]===c&&q[1]===r))continue;place(g,c,r,1,1,v);}};
+NEWPAT.spiral=(R,g)=>{rectW(g,6,2,13,9,1,[[6,5],[6,6]]);rectW(g,8,4,11,7,1,[[11,5],[11,6]]);place(g,9,5,1,1,2);};
+NEWPAT.labyrinth=(R,g)=>{[[3,15],[5,4],[7,15],[9,4]].forEach(([r,gap])=>{for(let c=4;c<=15;c++)if(c!==gap)place(g,c,r,1,1,1);});};
+NEWPAT.gates=(R,g)=>{for(const c of [5,8,11,14]){const gp=R.ri(1,8);for(let r=1;r<=10;r++)if(r!==gp&&r!==gp+1)place(g,c,r,1,1,1);}};
+NEWPAT.honeycomb=(R,g)=>{for(let r=2;r<=9;r+=3)for(let c=(r===5?7:5);c<=14;c+=4)place(g,c,r,2,1,1);};
+NEWPAT.bridges=(R,g)=>{for(let r=1;r<=10;r++)if(![2,5,6,9].includes(r)){place(g,9,r,1,1,8);place(g,10,r,1,1,8);}place(g,7,3,1,1,2);place(g,12,8,1,1,2);};
+NEWPAT.moat=(R,g)=>{rectW(g,6,2,13,9,8,[[9,2],[10,2],[9,9],[10,9],[6,5],[6,6],[13,5],[13,6]]);place(g,9,5,2,2,6);};
+NEWPAT.plus=(R,g)=>{place(g,9,3,2,2,1);place(g,9,7,2,2,1);place(g,5,5,2,1,1);place(g,13,6,2,1,1);};
+NEWPAT.diagonals=(R,g)=>{for(let i=0;i<4;i++){place(g,5+i,2+i,1,1,1);place(g,14-i,9-i,1,1,1);place(g,14-i,2+i,1,1,2);place(g,5+i,9-i,1,1,2);}};
+NEWPAT.waves=(R,g)=>{for(let c=5;c<=14;c++){const r=5+Math.round(2.2*Math.sin((c-5)*.75));place(g,c,r,1,2,1);}};
+NEWPAT.donut=(R,g)=>{rectW(g,7,3,12,8,2,[]);place(g,9,5,2,2,6);};
+NEWPAT.stairs=(R,g)=>{for(let i=0;i<6;i++){place(g,4+i*2,2+i,2,1,1);place(g,14-i*2,9-i,2,1,1);}};
+NEWPAT.scatter=(R,g)=>{const n=R.ri(10,16);for(let i=0;i<n;i++){const c=R.ri(4,15),r=R.ri(1,10),v=R.f()<.5?1:2;place(g,c,r,1,1,v);if(R.f()<.6)place(g,19-c,r,1,1,v);}};
+NEWPAT.trenches=(R,g)=>{for(const r of [3,8])for(let c=5;c<=14;c++)if(c!==7&&c!==12){place(g,c,r,1,1,8);place(g,c,r+1,1,1,8);}for(let i=0;i<4;i++)place(g,R.ri(5,14),R.ri(5,6),1,1,2);};
+NEWPAT.barricades=(R,g)=>{for(const c of [6,9,12])for(const r of [2,3,4,7,8,9])place(g,c,r,1,1,2);};
+NEWPAT.twinrooms=(R,g)=>{const gp=R.ri(1,3);for(let r=1;r<=10;r++)if(r!==5&&r!==6&&r!==gp&&r!==gp+7)place(g,9,r,1,1,1);for(const [c,r] of [[5,3],[5,8],[14,3],[14,8]])place(g,c,r,1,1,1);};
+NEWPAT.arrow=(R,g)=>{for(const [c,r] of [[7,3],[8,4],[9,5],[9,6],[8,7],[7,8]])place(g,c,r,1,1,1);place(g,6,5,1,2,2);place(g,12,2,1,2,1);place(g,12,8,1,2,1);};
+NEWPAT.frames=(R,g)=>{rectW(g,5,2,8,5,1,[[8,3]]);rectW(g,11,6,14,9,1,[[11,8]]);rectW(g,11,2,14,5,2,[]);rectW(g,5,6,8,9,2,[]);};
+NEWPAT.colonnade=(R,g)=>{for(let c=5;c<=14;c+=2){place(g,c,2,1,2,1);place(g,c,8,1,2,1);}};
+NEWPAT.lakes=(R,g)=>{for(let i=0;i<3;i++)place(g,R.ri(5,13),R.ri(1,8),2,R.ri(2,3),8);for(let i=0;i<2;i++)place(g,R.ri(5,13),R.ri(1,9),2,2,6);for(let i=0;i<3;i++)place(g,R.ri(5,14),R.ri(1,10),1,1,2);};
+NEWPAT.quarry=(R,g)=>{for(let i=0;i<5;i++)place(g,R.ri(4,14),R.ri(1,9),2,2,6);for(let i=0;i<4;i++)place(g,R.ri(5,14),R.ri(1,10),1,1,1);};
+NEWPAT.vault=(R,g)=>{rectW(g,8,4,11,7,1,[[8,5]]);place(g,9,5,2,2,2);};
+NEWPAT.cathedral=(R,g)=>{for(let c=6;c<=13;c+=2){place(g,c,3,1,1,1);place(g,c,8,1,1,1);}for(const [c,r] of [[5,1],[14,1],[5,10],[14,10]])place(g,c,r,1,1,2);};
+NEWPAT.ruins=(R,g)=>{const n=R.ri(6,9);for(let i=0;i<n;i++){const h=R.f()<.5,c=R.ri(4,14),r=R.ri(1,9),len=R.ri(2,3);place(g,c,r,h?len:1,h?1:len,1);if(R.f()<.5)place(g,19-c-(h?len-1:0),r,h?len:1,h?1:len,1);}};
+NEWPAT.bunkers=(R,g)=>{rectW(g,4,2,7,4,1,[[7,3]]);rectW(g,12,2,15,4,1,[[12,3]]);rectW(g,4,7,7,9,1,[[7,8]]);rectW(g,12,7,15,9,1,[[12,8]]);};
+NEWPAT.checkerwall=(R,g)=>{for(let c=5;c<=14;c++)for(let r=2;r<=9;r++)if((c+r)%3===0&&R.f()<.6)place(g,c,r,1,1,1);};
+const xGenPattern=genPattern;
+genPattern=function(R,kind){
+  if(NEWPAT[kind]){const g=blankGrid();NEWPAT[kind](R,g);return g;}
+  return xGenPattern(R,kind);
+};
+PATTERNS.push(...Object.keys(NEWPAT));
+/* 多數房間都改用新地形：原本 70% 提高到 85%，並且讓陷阱與魔晶礦房也能套用 */
+const xGenLayout=genLayout;
+genLayout=function(type,R){
+  if(['trap','mine'].includes(type)&&R.f()<.35){
+    for(let tries=0;tries<6;tries++){
+      const kind=PATTERNS[R.ri(0,PATTERNS.length-1)],g=genPattern(R,kind),reach=bfs(g);
+      if(reach.has(5*COLS+18)&&reach.has(6*COLS+18)&&reach.size>60){
+        if(type==='trap'){
+          const tiles=[...reach].filter(k=>{const c=k%COLS,r=Math.floor(k/COLS);return c>=4&&c<=15&&!(r>=5&&r<=6&&c>=16);});
+          const n=Math.min(tiles.length,R.ri(10,16)),rs=new Set(reach);
+          for(let i=0;i<n;i++){const k=tiles.splice(Math.floor(R.f()*tiles.length),1)[0];g[Math.floor(k/COLS)][k%COLS]=5;rs.delete(k);}
+          return {grid:g,reach:rs};   /* 尖刺可以走過去，所以出口仍然可達；只是不在尖刺上生怪 */
+        }
+        return {grid:g,reach};
+      }
+    }
+  }
+  return xGenLayout(type,R);
+};
+
+/* ---------- 3. special scenes ---------- */
+SPECIAL_THEMES.push(
+ {name:'雷鳴高原・暴雨平野',special:true,a:'#1a2030',b:'#1d2536',wall:'#2e3a58',top:'#4a5f8f',crate:'#6a7a9a',acc:'#fff27a',pat:'cloud',deco:'spark',skin:{tint:'#fff27a',mark:'bolt'},fx:'storm',desc:'特殊場景：閃電會落下，看準光圈迅速閃開'},
+ {name:'毒瘴沼澤・腐化濕地',special:true,a:'#1b2a1b',b:'#1f301f',wall:'#3a5030',top:'#5b7a3f',crate:'#6a5a3a',acc:'#b6ff5a',pat:'wave',deco:'toxic',skin:{tint:'#9be85a',mark:'toxic'},fx:'swamp',desc:'特殊場景：地上的毒霧會傷害你，也會傷害敵人'},
+ {name:'血月祭典・猩紅之夜',special:true,a:'#2a1218',b:'#321620',wall:'#5a1f2e',top:'#8a2f45',crate:'#7a3a3a',acc:'#ff3b55',pat:'gothic',deco:'ember',skin:{tint:'#ff3b55',mark:'fire'},fx:'blood',desc:'特殊場景：敵人更強更快，但擊殺會掉落更多補給'},
+ {name:'幽影迷宮・無光之地',special:true,a:'#0d0d16',b:'#10101c',wall:'#232338',top:'#3a3a5c',crate:'#44445a',acc:'#9a8aff',pat:'stars',deco:'mote',skin:{tint:'#9a8aff',mark:'void'},fx:'dark',desc:'特殊場景：視野受限，小心暗處的敵人'},
+ {name:'黃金寶庫・失落王庫',special:true,a:'#2a2410',b:'#302914',wall:'#6a5a20',top:'#a68a30',crate:'#c9a43a',acc:'#ffd166',pat:'marble',deco:'sparkle',skin:{tint:'#ffd166',mark:'crown'},fx:'vault',desc:'特殊場景：滿地寶箱，打碎它們獲得大量金幣'},
+ {name:'暴雪絕境・極地風暴',special:true,a:'#18283a',b:'#1b2e42',wall:'#3e6a8a',top:'#7ab4d8',crate:'#8fb0c8',acc:'#d8f4ff',pat:'ice',deco:'snow',skin:{tint:'#d8f4ff',mark:'ice'},fx:'blizzard',desc:'特殊場景：暴風雪會定時推著所有人走'},
+ {name:'隕石帶・墜星荒原',special:true,a:'#241a1a',b:'#2a1e1c',wall:'#5a3a30',top:'#8a5a40',crate:'#7a5a40',acc:'#ffb36b',pat:'cracks',deco:'ember',skin:{tint:'#ffb36b',mark:'fire'},fx:'meteor',desc:'特殊場景：隕石會墜落，並在地上留下魔晶'},
+ {name:'齒輪工廠・自動產線',special:true,a:'#1c1f24',b:'#20242b',wall:'#3a4252',top:'#6a7890',crate:'#7a6a50',acc:'#6ee7ff',pat:'grate',deco:'spark',skin:{tint:'#6ee7ff',mark:'gear'},fx:'factory',desc:'特殊場景：輸送帶會推動你和敵人'}
+);
+rollSpecial=function(f){
+  if(f<2)return null;
+  const R=srng('SPC'+f);
+  if(R.f()<.17)return SPECIAL_THEMES[Math.floor(R.f()*SPECIAL_THEMES.length)];
+  return null;
+};
+const SCENE_ROOMS=['battle','elite','ambush','trap','challenge','boss','mine'];
+const LANES=[{r:3,d:1},{r:8,d:-1}];
+function sceneFx(){return G&&G.floorSpecial&&G.floorSpecial.fx&&SCENE_ROOMS.includes(G.roomType)?G.floorSpecial.fx:null;}
+function pushAll(dx,dy,laneRow){
+  const inLane=o=>laneRow===undefined||Math.floor(o.y/T)===laneRow;
+  const p=G.player;
+  if(p&&!p.down&&!p.dash&&inLane(p))moveEnt(p,dx,dy);
+  for(const e of G.enemies)if(!e.dead&&!e.isBoss&&!e.boss&&!e.ghost&&inLane(e))moveEnt(e,dx,dy,!!(e.d&&e.d.fly));
+  for(const k of G.pick)if(!k.shop&&inLane(k)){const o={x:k.x,y:k.y,r:4};moveEnt(o,dx,dy);k.x=o.x;k.y=o.y;}
+}
+function sceneUpdate(dt){
+  const fx=sceneFx();
+  const Z=G.xz||(G.xz=[]);
+  if(!fx||G.state!=='play'||!G.player)return;
+  const p=G.player,S=G.xs||(G.xs={}),lv=Math.min(1,(G.floor-1)/25);
+  const every=(k,per)=>{S[k]=(S[k]||0)+dt;if(S[k]>=per){S[k]-=per;return true;}return false;};
+  if(fx==='storm'&&every('st',2.7-1.2*lv)){
+    let x,y;
+    if(Math.random()<.6||!G.enemies.length){x=p.x+rnd(-80,80);y=p.y+rnd(-80,80);}else{const e=pick(G.enemies);x=e.x;y=e.y;}
+    Z.push({k:'bolt',x:clamp(x,50,W-50),y:clamp(y,60,H-60),r:46,t:1,m:1});
+  }
+  if(fx==='meteor'&&every('mt',3.3-1.4*lv)){
+    Z.push({k:'meteor',x:rnd(80,W-80),y:rnd(80,H-80),r:58,t:1.25,m:1.25});
+  }
+  if(fx==='swamp'&&Z.filter(z=>z.k==='gas').length<3&&every('sw',2.4))Z.push({k:'gas',x:rnd(100,W-100),y:rnd(90,H-90),r:56,t:10,m:10,tick:0});
+  if(fx==='blizzard'){
+    S.gl=(S.gl||0)+dt;
+    if(!G.xgale&&S.gl>9){S.gl=0;G.xgale={t:3.5,dir:Math.random()<.5?-1:1};G.banner={text:'暴風雪來襲！',sub:'強風正在推著所有人走',t:1.6,col:'#d8f4ff'};}
+    if(G.xgale){G.xgale.t-=dt;pushAll(95*dt*G.xgale.dir,0);if(G.xgale.t<=0)G.xgale=null;}
+  }
+  if(fx==='factory')for(const L of LANES)pushAll(70*dt*L.d,0,L.r);
+  for(const z of Z){
+    z.t-=dt;
+    if(z.k==='bolt'&&z.t<=0){
+      addBolt(z.x,z.y-110,z.x,z.y,'#fff27a',3);
+      explode(z.x,z.y,z.r,40+G.floor*4,1,false);
+    }else if(z.k==='meteor'&&z.t<=0){
+      explode(z.x,z.y,z.r,50+G.floor*5,2,false);
+      if(Math.random()<.55)dropMat(z.x,z.y,.6);
+    }else if(z.k==='gas'){
+      z.tick+=dt;
+      if(z.tick>=1){
+        z.tick-=1;
+        if(Math.hypot(p.x-z.x,p.y-z.y)<z.r)hurt(1);
+        for(const e of G.enemies)if(!e.dead&&Math.hypot(e.x-z.x,e.y-z.y)<z.r+e.r)e.poison={t:2,dps:5+G.floor*.6};
+      }
+    }
+  }
+  G.xz=Z.filter(z=>z.t>0);
+}
+const xDrawFxHigh=drawFxHigh;
+drawFxHigh=function(){
+  xDrawFxHigh.apply(this,arguments);
+  try{sceneOverlay();}catch(e){}
+};
+function sceneOverlay(){
+  const fx=sceneFx();
+  if(!fx)return;
+  const p=G.player;
+  if(fx==='storm'||fx==='meteor'||fx==='swamp'){
+    for(const z of G.xz||[]){
+      if(z.k==='gas'){
+        ctx.globalAlpha=Math.min(.35,z.t*.1)*(.8+.2*Math.sin(G.t*3+z.x));ctx.fillStyle='#8ee04a';ctx.beginPath();ctx.arc(z.x,z.y,z.r,0,TAU);ctx.fill();
+        ctx.globalAlpha=.5*Math.min(1,z.t);ctx.strokeStyle='#b6ff5a';ctx.lineWidth=2;ctx.setLineDash([6,6]);ctx.beginPath();ctx.arc(z.x,z.y,z.r,0,TAU);ctx.stroke();ctx.setLineDash([]);
+      }else{
+        const k=1-z.t/z.m,col=z.k==='bolt'?'255,242,122':'255,140,60';
+        ctx.globalAlpha=1;ctx.fillStyle='rgba('+col+','+(.1+.3*k)+')';ctx.beginPath();ctx.arc(z.x,z.y,z.r,0,TAU);ctx.fill();
+        ctx.strokeStyle='rgba('+col+',.9)';ctx.lineWidth=2;ctx.beginPath();ctx.arc(z.x,z.y,z.r*(1-.25*(1-k)),0,TAU);ctx.stroke();
+        if(z.k==='meteor'){ctx.fillStyle='#ffb36b';ctx.beginPath();ctx.arc(z.x+(1-k)*-60,z.y-(1-k)*220,8,0,TAU);ctx.fill();}
+      }
+    }
+    ctx.globalAlpha=1;
+  }
+  if(fx==='factory'){
+    ctx.globalAlpha=.35;ctx.fillStyle='#6ee7ff';
+    for(const L of LANES)for(let c=1;c<=18;c++){
+      if(G.grid[L.r][c]!==0)continue;
+      const off=((G.t*50*L.d)%T+T)%T,x=c*T+off-T/2,y=L.r*T+T/2;
+      ctx.beginPath();ctx.moveTo(x-6*L.d,y-8);ctx.lineTo(x+6*L.d,y);ctx.lineTo(x-6*L.d,y+8);ctx.lineTo(x-2*L.d,y);ctx.fill();
+    }
+    ctx.globalAlpha=1;
+  }
+  if(fx==='blizzard'&&G.xgale){
+    ctx.globalAlpha=.4;ctx.strokeStyle='#fff';ctx.lineWidth=1.5;
+    for(let i=0;i<26;i++){const y=(i*53+G.t*40)%H,x=((i*97+G.t*G.xgale.dir*520)%W+W)%W;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+18*G.xgale.dir,y+3);ctx.stroke();}
+    ctx.globalAlpha=1;
+  }
+  if(fx==='blood'){
+    const g=ctx.createRadialGradient(W/2,H/2,H*.35,W/2,H/2,H*.95);g.addColorStop(0,'rgba(120,0,20,0)');g.addColorStop(1,'rgba(150,10,30,.38)');
+    ctx.fillStyle=g;ctx.fillRect(-20,-20,W+40,H+40);
+  }
+  if(fx==='dark'){
+    const g=ctx.createRadialGradient(p.x,p.y,60,p.x,p.y,200);g.addColorStop(0,'rgba(4,4,12,0)');g.addColorStop(1,'rgba(4,4,12,.9)');
+    ctx.fillStyle=g;ctx.fillRect(-20,-20,W+40,H+40);
+  }
+}
+function vaultCrates(){
+  if(!G.floorSpecial||G.floorSpecial.fx!=='vault')return;
+  if(!['battle','elite','ambush','trap','challenge'].includes(G.roomType))return;
+  const tiles=[...G.reach].filter(k=>{const c=k%COLS,r=Math.floor(k/COLS);return c>=4&&c<=15&&G.grid[r][c]===0&&!(r>=4&&r<=7&&(c<=5||c>=14));});
+  for(let i=tiles.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[tiles[i],tiles[j]]=[tiles[j],tiles[i]];}
+  let n=0,want=7+Math.floor(Math.random()*4),prev=G.reach.size;
+  for(const k of tiles){
+    if(n>=want)break;
+    const c=k%COLS,r=Math.floor(k/COLS);
+    G.grid[r][c]=2;
+    const rc=bfs(G.grid);
+    if(rc.has(5*COLS+18)&&rc.has(6*COLS+18)&&rc.size===prev-1){G.crates.set(k,3);n++;prev=rc.size;}else G.grid[r][c]=0;
+  }
+  G.reach=bfs(G.grid);
+}
+const xMakeEnemy=makeEnemy;
+makeEnemy=function(type,x,y,opt){
+  const e=xMakeEnemy(type,x,y,opt);
+  if(G&&G.floorSpecial&&G.floorSpecial.fx==='blood'&&G.roomType!=='boss'&&e){e.spdM*=1.18;e.hp*=1.2;e.maxhp=e.hp;}
+  return e;
+};
+const xHitCrate=hitCrate;
+hitCrate=function(c,r,d){
+  const k=r*COLS+c,had=G&&G.crates&&G.crates.has(k);
+  xHitCrate(c,r,d);
+  if(had&&!G.crates.has(k)&&G.floorSpecial&&G.floorSpecial.fx==='vault'){
+    const x=c*T+20,y=r*T+20;for(let i=0;i<3;i++)dropPick('coin',x,y);
+    if(Math.random()<.1)dropGear(x,y,rollQuality(.5));
+  }
+};
+
+/* ---------- 4. new facilities & event rooms ---------- */
+const NEWROOMS=['fortune','grind','bank','bounty','rune','blackmkt','mimic','trial','infuse','shrine','crystal'];
+Object.assign(ROOM_NAMES,{fortune:'命運占卜',grind:'磨刀石坊',bank:'魔晶銀行',bounty:'懸賞榜',rune:'符文石碑',blackmkt:'黑市',mimic:'可疑的寶箱',trial:'試煉擂台',infuse:'附魔工坊',shrine:'神龕',crystal:'魔晶礦洞'});
+Object.assign(ROOM_DESC,{fortune:'花金幣抽一張命運牌，換取隨機強化',grind:'磨利武器，本局傷害永久提升',bank:'存入金幣，下一層連本帶利領回',bounty:'接下懸賞，擊殺足夠敵人換取獎勵',rune:'用一點生命換取一次強化選擇',blackmkt:'買下神秘包裹，但要付出詛咒',mimic:'55% 是寶物，45% 是擬態怪',trial:'挑戰三波精英，勝利後獎勵豐厚',infuse:'為手上的武器附加隨機詞綴',shrine:'供奉金幣，獲得隨機祝福',crystal:'敲碎魔晶簇，獲得大量材料',gamble:'自訂下注金額：老虎機與擲幣'});
+const evCost=b=>Math.round(b*(1+.15*depthF()));
+function grantPerk(){
+  const pool=PERKS.filter(q=>(G.perk[q.id]||0)<q.max&&(!q.only||q.only===G.ch.id));
+  if(!pool.length)return null;
+  const q=pick(pool),p=G.player;
+  G.perk[q.id]=(G.perk[q.id]||0)+1;
+  if(q.id==='dash'){p.dashMax=1+pk('dash');p.dashN=Math.min(p.dashMax,p.dashN+1);}
+  if(q.id==='drone')addDrone();
+  recalc();if(q.id==='hp')p.hp=Math.min(p.maxhp,p.hp+2);
+  return q;
+}
+const lockFight=(waves,banner)=>{G.roomType='elite';G.locked=true;G.doorOpen=false;G.wave=0;G.waves=waves;G.waveDelay=.7;G.banner=banner;sfx(110,.5,'sawtooth',.08,-40);};
+Object.assign(EVT,{
+ fortune:{n:'命運占卜',ic:'🔮',col:'#c58bff',ask:()=>'花 '+evCost(40)+' 金幣抽一張命運牌（隨機強化，偶有代價）',
+  can:()=>G.coins>=evCost(40),
+  act(pr,p){
+    G.coins-=evCost(40);const r=Math.random()+luck()*.05;let q;
+    if(r<.55){q=grantPerk();addText(pr.x,pr.y-30,q?'命運：'+q.n:'牌面空白','#c58bff',1.3);}
+    else if(r<.8){q=grantPerk();p.hp=Math.min(p.maxhp,p.hp+1);addText(pr.x,pr.y-30,q?'命運：'+q.n+'＋生命':'命運眷顧','#c58bff',1.3);}
+    else if(r<.93){G.coins+=evCost(40)*2;addText(pr.x,pr.y-30,'財富牌：金幣 ×2','#ffd166',1.3);}
+    else{G.curse=(G.curse||0)+1;grantPerk();grantPerk();addText(pr.x,pr.y-30,'厄運牌：詛咒 +1，兩項強化','#b04aff',1.3);}
+    sfx(700,.3,'triangle',.06,300);}},
+ grind:{n:'磨刀石',ic:'🪨',col:'#9fb0d0',ask:()=>(G.grindN||0)>=3?'武器已磨到極限':'花 '+evCost(35)+' 金幣：本局傷害 +10%（已磨 '+(G.grindN||0)+'/3）',
+  can:()=>G.coins>=evCost(35)&&(G.grindN||0)<3,
+  act(pr,p){G.coins-=evCost(35);G.grindN=(G.grindN||0)+1;G.devilDmg=(G.devilDmg||0)+.1;addText(p.x,p.y-30,'傷害 +10%','#ff9a4a',1.3);parts2(pr.x,pr.y,14,'#ffd166',140,.5,3,'s',0,true);sfx(900,.2,'square',.05,300);}},
+ bank:{n:'魔晶銀行',ic:'🏦',col:'#ffd166',ask:()=>'存入一半金幣，下一層返還 135%（目前持有 '+G.coins+'）',
+  can:()=>G.coins>=20,
+  act(pr,p){const d=Math.floor(G.coins*.5);G.coins-=d;G.bank=(G.bank||0)+d;addText(p.x,p.y-30,'已存入 '+d+' 金幣','#ffd166',1.3);sfx(600,.2,'triangle',.05,200);}},
+ bounty:{n:'懸賞榜',ic:'📜',col:'#e8c88a',ask:()=>G.bounty?'已接下懸賞':'接下懸賞：之後擊殺 20 名敵人，獲得遺物與裝備',
+  can:()=>!G.bounty,
+  act(pr,p){G.bounty={n:0,need:20};G.banner={text:'懸賞已接下',sub:'擊殺 20 名敵人',t:2,col:'#e8c88a'};sfx(500,.2,'triangle',.05,200);}},
+ rune:{n:'符文石碑',ic:'🪬',col:'#8fd3ff',ask:()=>G.player.hp<=1?'生命太低，無法觸摸':'觸摸石碑：失去 1 點生命，選擇一項強化',
+  can:()=>G.player.hp>1,
+  act(pr,p){p.hp-=1;G.banner={text:'符文共鳴',sub:'選擇一項強化',t:2,col:'#8fd3ff'};setTimeout(()=>{if(G&&G.state==='play')offerPerk();},400);sfx(300,.4,'sine',.06,200);}},
+ blackmkt:{n:'黑市包裹',ic:'🕶️',col:'#b04aff',ask:()=>'花 '+evCost(55)+' 金幣：獲得 1 遺物與 1 件裝備，但詛咒 +1',
+  can:()=>G.coins>=evCost(55),
+  act(pr,p){G.coins-=evCost(55);G.curse=(G.curse||0)+1;dropPick('relic',pr.x-20,pr.y+34,{rid:rollRelic()});dropGear(pr.x+20,pr.y+34,rollQuality(.5));flashScreen('#6a1b9a',.2);sfx(120,.4,'sawtooth',.07,-40);}},
+ mimic:{n:'可疑寶箱',ic:'📦',col:'#ffb347',ask:()=>'打開寶箱：55% 大量寶物，45% 是擬態怪（精英戰）',
+  act(pr,p){
+    if(Math.random()<.55){for(let i=0;i<10;i++)dropPick('coin',pr.x,pr.y+30);dropGear(pr.x,pr.y+36,rollQuality(.8));if(Math.random()<.4)dropPick('relic',pr.x+26,pr.y+30,{rid:rollRelic()});G.banner={text:'是真正的寶箱！',sub:'',t:1.8,col:'#ffd166'};sfx(900,.3,'triangle',.06,400);}
+    else{lockFight(2,{text:'是擬態怪！',sub:'擊敗牠們',t:1.8,col:'#ff6b6b'});flashScreen('#a01030',.2);}}},
+ trial:{n:'試煉擂台',ic:'🏟️',col:'#ff9a6b',ask:()=>'挑戰三波精英，勝利後獲得 2 件裝備與 1 件遺物',
+  act(pr,p){G.trialBonus=true;lockFight(3,{text:'試煉開始！',sub:'撐過三波精英',t:1.8,col:'#ff9a6b'});flashScreen('#ff9a6b',.2);}},
+ infuse:{n:'附魔工坊',ic:'✨',col:'#ffd166',ask:()=>'花 '+evCost(60)+' 金幣：為手上武器附加一個隨機詞綴',
+  can:()=>G.coins>=evCost(60)&&G.player.w[G.player.cur]&&G.player.w[G.player.cur].aff,
+  act(pr,p){
+    G.coins-=evCost(60);const w=p.w[p.cur],have=w.aff||[];
+    const pool=AFFIX.filter(a=>!have.includes(a.id));const a=pick(pool.length?pool:AFFIX);
+    try{a.ap(w.d);}catch(e){}
+    w.aff=have.concat([a.id]);w.name=a.n+w.name;
+    addText(p.x,p.y-30,'附魔：'+a.n,'#ffd166',1.3);fxAdd('sigil',pr.x,pr.y,.8,{r:50,col:'#ffd166'});sfx(800,.3,'triangle',.06,500);}},
+ shrine:{n:'神龕',ic:'⛩️',col:'#ff7a7a',ask:()=>G.bless?'已獲得祝福':'供奉 '+evCost(30)+' 金幣：獲得隨機祝福（生命／傷害／幸運）',
+  can:()=>G.coins>=evCost(30)&&!G.bless,
+  act(pr,p){G.coins-=evCost(30);G.bless=pick(['hp','dmg','luck']);recalc();if(G.bless==='hp')p.hp=Math.min(p.maxhp,p.hp+1);addText(p.x,p.y-30,'祝福：'+({hp:'生命',dmg:'傷害',luck:'幸運'}[G.bless]),'#ff7a7a',1.3);sfx(700,.3,'sine',.06,300);}},
+ crystal:{n:'魔晶簇',ic:'💠',col:'#7df9ff',ask:()=>'敲碎魔晶簇：獲得大量材料與金幣',
+  act(pr,p){matBurst(pr.x,pr.y+30,8+G.floor,1.2);for(let i=0;i<8;i++)dropPick('coin',pr.x,pr.y+30);parts2(pr.x,pr.y,24,'#7df9ff',200,.7,3,'s',0,true);sfx(520,.3,'triangle',.06,400);}}
+});
+const xEnterExtraRoom=enterExtraRoom;
+enterExtraRoom=function(type){
+  if(EVT[type]&&NEWROOMS.includes(type)){
+    G.props.push({kind:'evt',id:type,x:400,y:235,used:false});
+    G.banner={text:ROOM_NAMES[type],sub:ROOM_DESC[type],t:2.4,col:EVT[type].col};
+    return true;
+  }
+  const ok=xEnterExtraRoom(type);
+  if(ok&&type==='gamble'){
+    const slot=G.props.find(q=>q.kind==='gamble');if(slot)slot.x=320;
+    G.props.push({kind:'flip',x:480,y:235,used:false,n:0});
+  }
+  return ok;
+};
+const xGenRooms=genRooms;
+genRooms=function(f){
+  const t=xGenRooms(f);
+  if(G&&G.tower)return t;
+  const R=srng('XE'+f),used=new Set(t);
+  for(let i=1;i<t.length-1;i++){
+    if(t[i]!=='battle'||R.f()>=.16)continue;
+    const pool=NEWROOMS.filter(x=>!used.has(x)&&t[i-1]!==x&&t[i+1]!==x);
+    if(!pool.length)continue;
+    const k=pool[Math.floor(R.f()*pool.length)];t[i]=k;used.add(k);
+  }
+  return t;
+};
+const xKillEnemy2=killEnemy;
+killEnemy=function(e){
+  const was=e&&e.dead;
+  xKillEnemy2.apply(this,arguments);
+  if(was||!G||!e||!G.player)return;
+  const th=G.floorSpecial;
+  if(th&&th.fx==='blood'&&G.roomType!=='boss'){drops(e.x,e.y,2);if(Math.random()<.22)dropPick('heart',e.x,e.y);}
+  if(G.bounty){
+    G.bounty.n++;
+    if(G.bounty.n>=G.bounty.need){
+      G.bounty=null;const p=G.player;
+      dropPick('relic',p.x+30,p.y,{rid:rollRelic()});dropGear(p.x-30,p.y,rollQuality(.8));for(let i=0;i<6;i++)dropPick('coin',p.x,p.y);
+      G.banner={text:'懸賞完成！',sub:'獎勵掉落在你身邊',t:2.4,col:'#e8c88a'};sfx(900,.4,'triangle',.06,400);
+    }
+  }
+};
+const xClearRoom=clearRoom;
+clearRoom=function(){
+  const trial=G&&G.trialBonus;
+  xClearRoom.apply(this,arguments);
+  if(trial&&G){G.trialBonus=false;dropGear(W/2-30,H/2+40,rollQuality(.9));dropGear(W/2+30,H/2+40,rollQuality(.9));dropPick('relic',W/2,H/2+60,{rid:rollRelic()});}
+};
+const xNextFloor=nextFloor;
+nextFloor=function(){
+  const bank=G&&G.bank;
+  xNextFloor.apply(this,arguments);
+  if(!G)return;
+  if(bank){const ret=Math.round(bank*1.35);G.coins+=ret;G.bank=0;addText(G.player.x,G.player.y-34,'銀行返還 '+ret+' 金幣','#ffd166',1.3);}
+  if(G.floorSpecial&&G.floorSpecial.desc&&G.banner)G.banner.sub=G.floorSpecial.desc;
+};
+
+/* ---------- 5. free-bet gambling ---------- */
+const xPromptExtra=promptExtra;
+promptExtra=function(pr,k){
+  if(pr.kind==='gamble')return k+' 老虎機：自訂下注金額（剩 '+(5-(pr.ref.n||0))+' 次）';
+  if(pr.kind==='flip')return k+' 擲幣：自訂下注金額，50% 翻倍（剩 '+(8-(pr.ref.n||0))+' 次）';
+  return xPromptExtra(pr,k);
+};
+const xInteractExtra=interactExtra;
+interactExtra=function(t){
+  if(t.kind==='gamble'||t.kind==='flip'){openBet(t.ref,t.kind);return true;}
+  return xInteractExtra(t);
+};
+const xDrawExtraProp=drawExtraProp;
+drawExtraProp=function(pr,x,y){
+  if(pr.kind==='flip'){
+    ctx.fillStyle='#2a4a6a';ctx.fillRect(x-22,y-4,44,16);ctx.fillStyle='#3a6a8a';ctx.fillRect(x-26,y-8,52,8);
+    const sp=Math.abs(Math.sin(G.t*3)),w=Math.max(2,16*sp);
+    ctx.fillStyle='#ffd166';ctx.beginPath();ctx.ellipse(x,y-20-sp*4,w,8,0,0,TAU);ctx.fill();
+    ctx.strokeStyle='#b8860b';ctx.lineWidth=2;ctx.stroke();
+    ctx.font='12px '+FONT;ctx.textAlign='center';ctx.fillStyle='#ffd166';ctx.fillText('擲幣 '+(pr.n||0)+'/8',x,y+32);
+    return true;
+  }
+  if(pr.kind==='gamble'){
+    const r=xDrawExtraProp(pr,x,y);
+    ctx.font='12px '+FONT;ctx.textAlign='center';ctx.fillStyle='#ffd166';ctx.fillText('老虎機 '+(pr.n||0)+'/5',x,y+46);
+    return r;
+  }
+  return xDrawExtraProp(pr,x,y);
+};
+function openBet(ref,kind){
+  const p=G.player;
+  if(G.state!=='play'||G.perkChoice||G.betUI)return;
+  const max=kind==='flip'?8:5;
+  if((ref.n||0)>=max){addText(p.x,p.y-28,'今天就玩到這裡','#8e97b5');return;}
+  if(G.coins<1){addText(p.x,p.y-28,'沒有金幣可以下注','#ff5d6c');sfx(120,.1,'square',.04);return;}
+  G.betUI={ref,kind};G.state='pause';mouse.down=false;touch.fire=false;
+  G.bet=Math.max(1,Math.min(G.coins,G.betLast||gambleCost()));
+  renderBet();
+}
+function readBetInput(){
+  try{if(G.betInp){const v=Math.floor(Number(G.betInp.value));if(v>0)G.bet=v;}}catch(e){}
+  G.bet=Math.max(1,Math.min(G.coins,Math.floor(G.bet)||1));
+}
+function renderBet(){
+  const bu=G.betUI;if(!bu)return;
+  G.bet=Math.max(1,Math.min(G.coins,Math.floor(G.bet)||1));
+  const adj=d=>()=>{readBetInput();G.bet+=d;renderBet();};
+  const set=v=>()=>{G.bet=Math.max(1,v);renderBet();};
+  const flip=bu.kind==='flip';
+  showOv(flip?'擲幣：決定下注金額':'老虎機：決定下注金額','持有 '+G.coins+' 金幣　本次下注 '+G.bet+'　'+(flip?'猜中翻倍（×2）':'最高可贏 12 倍，高倍率附贈裝備／遺物'),[
+    {label:'−100',fn:adj(-100)},{label:'−10',fn:adj(-10)},{label:'+10',fn:adj(10)},{label:'+100',fn:adj(100)},
+    {label:'¼',fn:set(Math.floor(G.coins/4))},{label:'½',fn:set(Math.floor(G.coins/2))},{label:'全押',fn:set(G.coins)},
+    {label:'下注 '+G.bet+' 金幣',main:true,fn:confirmBet},{label:'離開',fn:closeBet}]);
+  try{
+    const inp=document.createElement('input');inp.type='number';inp.min='1';inp.max=String(G.coins);inp.value=String(G.bet);inp.className='btn';
+    inp.style.cssText='width:140px;margin:6px auto;display:block;text-align:center';inp.setAttribute('aria-label','自訂下注金額');
+    const row=$('ovB');row.parentNode.insertBefore(inp,row);G.betInp=inp;
+    inp.addEventListener('keydown',ev=>{ev.stopPropagation();if(ev.key==='Enter')confirmBet();});
+  }catch(e){G.betInp=null;}
+}
+function closeBet(){
+  if(!G)return;
+  G.betUI=null;G.betInp=null;
+  if(G.state==='pause')G.state='play';
+  hideOv();try{cv.focus({preventScroll:true});}catch(e){}
+}
+function confirmBet(){
+  const bu=G&&G.betUI;if(!bu)return;
+  readBetInput();
+  const v=Math.max(1,Math.min(G.coins,G.bet));
+  G.betLast=v;G.coins-=v;bu.ref.n=(bu.ref.n||0)+1;
+  closeBet();
+  resolveBet(bu.ref,bu.kind,v);
+}
+const SLOT_TIERS=[[.55,0,'沒中…'],[.76,1.2,'小贏'],[.88,2,'中獎！'],[.95,3,'大獎！'],[.99,5,'超級大獎！'],[9,12,'JACKPOT！']];
+function resolveBet(ref,kind,v){
+  const p=G.player,x=ref.x,y=ref.y+30;
+  fxAdd('shock',ref.x,ref.y,.4,{r:40,col:'#ffd166',th:4});
+  if(kind==='flip'){
+    if(Math.random()<.48+luck()*.02){G.coins+=v*2;addText(ref.x,ref.y-24,'猜中！ +'+v,'#ffd166',1.4);parts2(x,y,14,'#ffd166',160,.6,3,'s',0,true);sfx(900,.3,'triangle',.06,400);}
+    else{addText(ref.x,ref.y-24,'猜錯… -'+v,'#8e97b5',1.2);sfx(150,.2,'sawtooth',.05,-60);}
+    return;
+  }
+  const q=Math.random()+luck()*.05;
+  let tier=SLOT_TIERS[SLOT_TIERS.length-1];
+  for(const t of SLOT_TIERS){if(q<t[0]){tier=t;break;}}
+  const mult=tier[1],pay=Math.round(v*mult);
+  if(mult===0){addText(ref.x,ref.y-24,tier[2]+' -'+v,'#8e97b5',1.2);sfx(150,.2,'sawtooth',.05,-60);return;}
+  G.coins+=pay;
+  addText(ref.x,ref.y-24,tier[2]+' +'+(pay-v),mult>=3?'#ffb347':'#ffd166',mult>=3?1.5:1.2);
+  parts2(x,y,10+mult*2,'#ffd166',170,.7,3,'s',0,true);sfx(700+mult*40,.3,'triangle',.06,300+mult*30);
+  const scale=Math.min(1.2,.3*v/gambleCost());
+  if(mult>=3)dropGear(x,y,rollQuality(scale+(mult>=5?.4:0)));
+  if(mult>=5&&Math.random()<.6)dropPick('relic',x+20,y,{rid:rollRelic()});
+  if(mult>=12){dropGear(x-20,y,rollQuality(1));G.banner={text:'JACKPOT！',sub:'贏得 '+pay+' 金幣與大量寶物',t:2.5,col:'#ffd166'};flashScreen('#ffd166',.3);sfx(1200,.6,'triangle',.07,600);}
+}
+
+/* ---------- 6. hooks ---------- */
+const xEnterRoomT=enterRoom;
+enterRoom=function(){
+  xEnterRoomT.apply(this,arguments);
+  if(!G)return;
+  G.xz=[];G.xs={};G.xgale=null;
+  try{vaultCrates();}catch(e){}
+  unstickAll();
+};
+const xUpdateT=update;
+update=function(dt){
+  xUpdateT.apply(this,arguments);
+  if(!G||G.state!=='play')return;
+  try{sceneUpdate(dt);}catch(e){}
+  G.xuT=(G.xuT||0)+dt;
+  if(G.xuT>=.25){G.xuT=0;unstickAll();}
+};
+/* =====================================================================
+   WEB BUILD ONLY: account system (Supabase) – register / login, cloud save,
+   leaderboard, and inheriting the guest (local) record on first login.
+   ===================================================================== */
+const WEBCFG=(window.MOJING_CONFIG||{});
+let webSb=null,webUser=null,webLastSync=0,webT=null,webBusy=false,webMsg='';
+function webReady(){return !!(window.supabase&&WEBCFG.supabaseUrl&&WEBCFG.supabaseKey&&!/YOUR_/.test(WEBCFG.supabaseUrl));}
+function progScore(s){
+  if(!s)return 0;
+  const lv=Object.values(s.cl||{}).reduce((a,c)=>a+(c.lv||1),0);
+  return (s.runs||0)*20+(s.bestFloor||0)*100+lv*10+Math.floor((s.crystals||0)/10)+((s.gear||[]).length)*3+((s.pets||[]).length)*5+Object.keys(s.skinOwn||{}).length*20;
+}
+function saveBackup(tag){
+  try{
+    const k='mjd_backup_'+tag+'_'+Date.now();localStorage.setItem(k,JSON.stringify(save));
+    const ks=Object.keys(localStorage).filter(x=>x.startsWith('mjd_backup_')).sort();
+    while(ks.length>4)localStorage.removeItem(ks.shift());
+  }catch(e){}
+}
+function unionBy(a,b,key){const m=new Map();for(const x of (a||[]).concat(b||[]))if(x&&!m.has(x[key]))m.set(x[key],x);return [...m.values()];}
+function mergeSaves(a,b){
+  // a = higher-progress base, b = the other one; keep everything the base has, add what only b has
+  const o=JSON.parse(JSON.stringify(a)),p=b;
+  o.chars=[...new Set([...(o.chars||[]),...(p.chars||[])])];
+  o.skills=[...new Set([...(o.skills||[]),...(p.skills||[])])];
+  o.skinOwn=Object.assign({},p.skinOwn||{},o.skinOwn||{});
+  o.wpn=Object.assign({},p.wpn||{},o.wpn||{});
+  o.titles=Object.assign({},p.titles||{},o.titles||{});
+  o.codex=Object.assign({},p.codex||{},o.codex||{});
+  o.gear=unionBy(o.gear,p.gear,'uid');o.pets=unionBy(o.pets,p.pets,'uid');
+  for(const k of ['crystals','food','bestScore','bestFloor','runs'])o[k]=Math.max(o[k]||0,p[k]||0);
+  o.cl=Object.assign({},p.cl||{});for(const k in (a.cl||{}))if(!o.cl[k]||(a.cl[k].lv||1)>=(o.cl[k].lv||1))o.cl[k]=a.cl[k];
+  if(p.st&&o.st)for(const k in o.st)o.st[k]=Math.max(o.st[k]||0,p.st[k]||0);
+  if(p.cdx&&o.cdx)for(const g of ['mon','boss','relic','skill','evt'])o.cdx[g]=Object.assign({},p.cdx[g]||{},o.cdx[g]||{});
+  o.ts=Date.now();
+  return o;
+}
+function adoptSave(s){
+  const keepAcct=webUser?webUser.id:s.acct;
+  save=Object.assign(SAVE0(),s);save.acct=keepAcct;save.ts=Date.now();
+  try{localStorage.setItem('mjd_save2',JSON.stringify(save));}catch(e){}
+  try{cdxInit();gachaInit();v10Init();v11Init();}catch(e){}
+  if(netDb)webPushNow();
+  if(!menuEl.classList.contains('hidden'))renderHub();
+}
+/* ---- Supabase adapters that mimic the Claude-artifact db / room APIs, so every online feature works unchanged ---- */
+function mkSbDb(sb,uid){
+  const parse=p=>{const i=p.indexOf('/');return {coll:p.slice(0,i),id:p.slice(i+1)};};
+  return {
+    doc(path){
+      const {coll,id}=parse(path);
+      return {
+        async set(data){
+          const r=await sb.from('docs').upsert({coll,doc_id:id,uid,data,updated_at:new Date().toISOString()},{onConflict:'coll,doc_id'});
+          if(r.error){const e=new Error(r.error.message);e.code=r.error.code;throw e;}
+        },
+        async get(){
+          const r=await sb.from('docs').select('data').eq('coll',coll).eq('doc_id',id).maybeSingle();
+          if(r.error)throw r.error;
+          return {exists:!!r.data,data:()=>r.data?r.data.data:undefined};
+        }
+      };
+    },
+    collection(name){
+      let f='score',n=20;
+      const q={
+        orderBy(field){f=['score','dmg','ts'].includes(field)?field:'updated_at';return q;},
+        limit(x){n=x;return q;},
+        onSnapshot(cb,err){
+          let alive=true,t=null;
+          const run=async()=>{
+            if(!alive)return;
+            try{
+              const r=await sb.from('docs').select('data').eq('coll',name).order(f,{ascending:false,nullsFirst:false}).limit(n);
+              if(r.error)throw r.error;
+              cb({docs:r.data.map(x=>({data:()=>x.data}))});
+            }catch(e){if(err)err(e);}
+          };
+          run();
+          const iv=setInterval(run,12000);
+          let ch=null;
+          try{ch=sb.channel('docs-'+name+'-'+Math.random().toString(36).slice(2,8)).on('postgres_changes',{event:'*',schema:'public',table:'docs',filter:'coll=eq.'+name},()=>{clearTimeout(t);t=setTimeout(run,500);}).subscribe();}catch(e){}
+          return ()=>{alive=false;clearInterval(iv);clearTimeout(t);try{if(ch)sb.removeChannel(ch);}catch(e){}};
+        }
+      };
+      return q;
+    }
+  };
+}
+function mkSbRoomNs(sb){
+  return {async join(name){
+    const me='p'+Math.random().toString(36).slice(2,10);
+    const Hd={},peers={},pcbs=[];let mine,lastSend=0,alive=true;
+    const ch=sb.channel('room:'+name,{config:{broadcast:{self:false,ack:false}}});
+    const fire=()=>pcbs.slice().forEach(f=>{try{f();}catch(e){}});
+    const sendP=()=>{if(mine===undefined)return;try{ch.send({type:'broadcast',event:'__p',payload:{id:me,p:mine}});}catch(e){}};
+    ch.on('broadcast',{event:'*'},m=>{
+      const ev=m.event,pl=m.payload;
+      if(ev==='__p'){if(!pl||pl.id===me)return;const isNew=!peers[pl.id];peers[pl.id]={presence:pl.p,at:Date.now()};if(isNew){fire();sendP();}}
+      else if(ev==='__bye'){if(pl&&peers[pl.id]){delete peers[pl.id];fire();}}
+      else (Hd[ev]||[]).slice().forEach(f=>{try{f({isMe:false,data:pl});}catch(e){}});
+    });
+    await new Promise((res,rej)=>{ch.subscribe(st=>{if(st==='SUBSCRIBED')res();else if(st==='CHANNEL_ERROR'||st==='TIMED_OUT'||st==='CLOSED')rej(new Error(st));});});
+    const hb=setInterval(()=>{
+      if(!alive)return;sendP();
+      const now=Date.now();let ch2=false;for(const k in peers)if(now-peers[k].at>6000){delete peers[k];ch2=true;}
+      if(ch2)fire();
+    },2000);
+    return {
+      async presence(o){mine=o;const now=Date.now();if(now-lastSend>=80){lastSend=now;sendP();}},
+      peers(){const a=[{isMe:true,sameTab:true,peer:me,kind:'viewer',presence:mine}];for(const k in peers)a.push({isMe:false,sameTab:false,peer:k,kind:'viewer',presence:peers[k].presence});return a;},
+      emit(t,d){try{ch.send({type:'broadcast',event:t,payload:d});}catch(e){}},
+      on(t,f){(Hd[t]=Hd[t]||[]).push(f);return()=>{Hd[t]=(Hd[t]||[]).filter(x=>x!==f);};},
+      onPeers(f){pcbs.push(f);return()=>{const i=pcbs.indexOf(f);if(i>=0)pcbs.splice(i,1);};},
+      leave(){alive=false;clearInterval(hb);try{ch.send({type:'broadcast',event:'__bye',payload:{id:me}});}catch(e){}setTimeout(()=>{try{sb.removeChannel(ch);}catch(e){}},250);}
+    };
+  }};
+}
+let webLbUnsub=null;
+function webGoOnline(user){
+  netUid=user.id;netDb=mkSbDb(webSb,user.id);netRoomNs=mkSbRoomNs(webSb);
+  try{if(webLbUnsub)webLbUnsub();}catch(e){}
+  try{webLbUnsub=netDb.collection('leaderboard').orderBy('score','desc').limit(20).onSnapshot(s=>{lbRows=s.docs.map(d=>d.data());lbOk=true;if(!menuEl.classList.contains('hidden')&&tab==='lb')renderHub();},()=>{lbOk=false;lbErr='read';});}catch(e){}
+  if(!save.bestRec&&save.bestScore>0)save.bestRec={score:save.bestScore,floor:save.bestFloor||1,kills:0,ch:save.sel||'knight'};
+  try{netBoard();}catch(e){}
+  const st=$('netst');if(st)st.textContent=netStatusText();
+}
+function webGoOffline(){
+  try{if(webLbUnsub)webLbUnsub();}catch(e){}webLbUnsub=null;
+  try{netLeave();}catch(e){}try{hubLeave();}catch(e){}
+  netDb=null;netUid=null;netRoomNs=null;lbRows=[];lbOk=false;
+}
+const webSavePath=()=>'data/users/'+webUser.id+'/save';
+async function webPushNow(){
+  if(!webReady()||!webUser||!netDb)return;
+  try{await netDb.doc(webSavePath()).set(JSON.parse(JSON.stringify(save)));webLastSync=Date.now();webMsg='';}
+  catch(e){webMsg='同步失敗：'+(e&&e.message?e.message:'網路異常');}
+}
+function cardOf(title,s){
+  const d=el('div','item');
+  const lv=Object.values(s.cl||{}).reduce((a,c)=>Math.max(a,c.lv||1),1);
+  d.append(el('b','',title),el('small','','出擊 '+(s.runs||0)+' 次　最深第 '+(s.bestFloor||0)+' 層'),el('small','','💎 '+(s.crystals||0)+'　角色 '+(s.chars||[]).length+'　最高角色等級 '+lv),
+    el('small','','寵物 '+(s.pets||[]).length+'　裝備 '+(s.gear||[]).length+'　最後存檔：'+(s.ts?new Date(s.ts).toLocaleString():'—')));
+  return d;
+}
+function inheritDialog(local,cloud){
+  return new Promise(res=>{
+    const ov=el('div','fx-ov');ov.style.cssText='position:fixed;inset:0;z-index:99;background:rgba(5,6,12,.88);display:flex;align-items:center;justify-content:center;padding:16px;overflow:auto';
+    const box=el('div','');box.style.cssText='max-width:520px;width:100%;display:flex;flex-direction:column;gap:10px;background:var(--panel,#1a1d2b);border:2px solid var(--gold,#ffc857);padding:16px';
+    box.appendChild(el('b','','📦 發現兩份紀錄，要怎麼處理？'));
+    box.appendChild(el('p','note','這個瀏覽器有尚未綁定帳號的本機紀錄，而你的帳號雲端也已有紀錄。未被選中的一份會先備份在瀏覽器中，不會直接消失。'));
+    box.appendChild(cardOf('🖥️ 本機紀錄（訪客）',local));box.appendChild(cardOf('☁️ 帳號雲端紀錄',cloud));
+    const mk=(txt,cls,v)=>{const b=el('button','btn '+(cls||''),txt);b.type='button';b.addEventListener('click',()=>{ov.remove();res(v);});box.appendChild(b);};
+    mk('🔀 合併（推薦）：以進度較高者為主，補上雙方獨有的角色、寵物、裝備、外觀','main','merge');
+    mk('🖥️ 只用本機紀錄（覆蓋雲端）','','local');
+    mk('☁️ 只用雲端紀錄（本機紀錄先備份）','','cloud');
+    ov.appendChild(box);document.body.appendChild(ov);
+  });
+}
+async function webAfterLogin(user){
+  if(webUser&&webUser.id===user.id&&netDb)return;
+  webUser=user;
+  if(!save.name){const n=(user.email||'').split('@')[0].slice(0,10);if(n)save.name=n;}
+  const tmpDb=mkSbDb(webSb,user.id);
+  let cloud=null;
+  try{const snap=await tmpDb.doc('data/users/'+user.id+'/save').get();cloud=snap.exists?snap.data():null;}catch(e){webMsg='讀取雲端失敗：'+(e&&e.message||'');}
+  const local=save;let msg='';
+  if(!cloud){
+    save.acct=user.id;msg=progScore(local)>0?'已把目前的本機紀錄綁定到帳號':'帳號已建立，紀錄會自動雲端備份';
+  }else if(local.acct===user.id){
+    if((cloud.ts||0)>(local.ts||0)){saveBackup('local');adoptSave(cloud);msg='已載入較新的雲端紀錄';}
+  }else if(progScore(local)<=0){
+    adoptSave(cloud);msg='已載入帳號雲端紀錄';
+  }else{
+    const choice=await inheritDialog(local,cloud);
+    saveBackup('before_'+choice);
+    if(choice==='local'){save.acct=user.id;msg='已用本機紀錄覆蓋雲端';}
+    else if(choice==='cloud'){adoptSave(cloud);msg='已載入雲端紀錄';}
+    else{const base=progScore(local)>=progScore(cloud)?local:cloud,oth=base===local?cloud:local;const m=mergeSaves(base,oth);m.acct=user.id;adoptSave(m);msg='已合併兩份紀錄';}
+  }
+  webGoOnline(user);
+  persist();await webPushNow();
+  if(msg)toast(msg);
+  if(!menuEl.classList.contains('hidden'))renderHub();
+}
+async function webInit(){
+  if(window.claude||!webReady())return;
+  try{
+    webSb=window.supabase.createClient(WEBCFG.supabaseUrl,WEBCFG.supabaseKey);
+    webSb.auth.onAuthStateChange((ev,sess)=>{
+      if(ev==='SIGNED_OUT'){webUser=null;webGoOffline();if(!menuEl.classList.contains('hidden'))renderHub();}
+      else if((ev==='SIGNED_IN'||ev==='INITIAL_SESSION')&&sess&&sess.user&&(!webUser||webUser.id!==sess.user.id)){setTimeout(()=>webAfterLogin(sess.user),0);}
+    });
+  }catch(e){webSb=null;}
+}
+async function webSignUp(email,pw){
+  webBusy=true;webMsg='';renderHub();
+  try{
+    const r=await webSb.auth.signUp({email,password:pw,options:{emailRedirectTo:location.href.split('#')[0]}});
+    if(r.error)webMsg='註冊失敗：'+r.error.message;
+    else if(!r.data.session)webMsg='✅ 已寄出驗證信，請到信箱點連結完成註冊。目前的本機紀錄會保留，驗證並登入後會詢問是否綁定到帳號。';
+  }catch(e){webMsg='註冊失敗：網路異常';}
+  webBusy=false;renderHub();
+}
+async function webSignIn(email,pw){
+  webBusy=true;webMsg='';renderHub();
+  try{const r=await webSb.auth.signInWithPassword({email,password:pw});if(r.error)webMsg='登入失敗：'+(/Invalid/i.test(r.error.message)?'帳號或密碼不正確':r.error.message);}
+  catch(e){webMsg='登入失敗：網路異常';}
+  webBusy=false;renderHub();
+}
+async function webSignOut(){await webPushNow();try{await webSb.auth.signOut();}catch(e){}webUser=null;webGoOffline();toast('已登出（本機仍保留目前紀錄）');renderHub();}
+(function(){
+  const st=netStatusText;
+  netStatusText=function(){if(window.claude)return st();return webUser?'已登入：'+(webUser.email||'帳號')+'　雲端存檔、排行榜、聊天、PvP、世界王：開':(webReady()?'訪客模式（可到「帳號」頁註冊／登入）':'單機模式');};
+})();
+function hubAccount(){
+  const box=el('div');box.style.cssText='display:flex;flex-direction:column;gap:12px;max-width:520px';
+  box.appendChild(el('b','','🔐 帳號與雲端存檔'));
+  if(!webReady()){
+    box.appendChild(el('p','note','此網站尚未設定帳號服務。管理者需要依 README 建立免費的 Supabase 專案，把網址與公開金鑰填入 config.js。設定完成前，遊戲仍可用訪客模式遊玩，紀錄存在這個瀏覽器。'));
+    bodyEl.appendChild(box);return;
+  }
+  if(webUser){
+    const c=el('div','item');
+    c.append(el('b','','✅ 已登入：'+(webUser.email||'')),el('small','','雲端存檔：'+(webLastSync?'上次同步 '+new Date(webLastSync).toLocaleTimeString():'尚未同步')),el('small','',webMsg||'每次存檔後約 2 秒會自動同步'));
+    box.appendChild(c);
+    const row=el('div','brow');
+    const s1=el('button','btn main','立即同步');s1.type='button';s1.addEventListener('click',async()=>{await webPushNow();toast(webMsg||'已同步');renderHub();});
+    const s2=el('button','btn','從雲端還原');s2.type='button';s2.addEventListener('click',async()=>{try{const r=await netDb.doc(webSavePath()).get();if(r.exists){saveBackup('manual');adoptSave(r.data());toast('已從雲端還原');}}catch(e){toast('還原失敗');}});
+    const s3=el('button','btn','登出');s3.type='button';s3.addEventListener('click',webSignOut);
+    row.append(s1,s2,s3);box.appendChild(row);
+    box.appendChild(cardOf('目前進度',save));
+    bodyEl.appendChild(box);return;
+  }
+  const info=el('div','item');
+  info.append(el('b','','👤 目前是訪客模式'),el('small','','進度：出擊 '+(save.runs||0)+' 次、最深第 '+(save.bestFloor||0)+' 層、💎'+(save.crystals||0)),
+    el('small','','註冊或登入後，系統會詢問是否把這份本機紀錄綁定到帳號（可選擇合併、只用本機、只用雲端）。'));
+  box.appendChild(info);
+  const em=document.createElement('input');em.type='email';em.placeholder='電子郵件';em.autocomplete='email';em.className='btn';em.style.width='100%';
+  const pw=document.createElement('input');pw.type='password';pw.placeholder='密碼（至少 6 碼）';pw.autocomplete='current-password';pw.className='btn';pw.style.width='100%';
+  box.append(em,pw);
+  const row=el('div','brow');
+  const lg=el('button','btn main','登入');lg.type='button';lg.disabled=webBusy;lg.addEventListener('click',()=>{if(em.value&&pw.value)webSignIn(em.value.trim(),pw.value);else toast('請輸入電子郵件與密碼');});
+  const rg=el('button','btn','註冊新帳號');rg.type='button';rg.disabled=webBusy;rg.addEventListener('click',()=>{if(!em.value||pw.value.length<6){toast('請輸入電子郵件與至少 6 碼的密碼');return;}webSignUp(em.value.trim(),pw.value);});
+  const gh=el('button','btn','用 GitHub 登入');gh.type='button';gh.addEventListener('click',async()=>{try{const r=await webSb.auth.signInWithOAuth({provider:'github',options:{redirectTo:location.href.split('#')[0]}});if(r.error)webMsg='GitHub 登入失敗：'+r.error.message;}catch(e){webMsg='GitHub 登入失敗';}renderHub();});
+  const fp=el('button','btn','忘記密碼');fp.type='button';fp.addEventListener('click',async()=>{if(!em.value){toast('請先輸入電子郵件');return;}try{const r=await webSb.auth.resetPasswordForEmail(em.value.trim(),{redirectTo:location.href.split('#')[0]});webMsg=r.error?'寄送失敗：'+r.error.message:'已寄出重設密碼信';}catch(e){webMsg='寄送失敗';}renderHub();});
+  row.append(lg,rg,gh,fp);box.appendChild(row);
+  if(webMsg)box.appendChild(el('p','note',webMsg));
+  bodyEl.appendChild(box);
+}
+TABX.account=hubAccount;
+(function(){const td=TABDEF;TABDEF=function(c){const a=td(c);a.splice(Math.max(0,a.length-1),0,['account','🔐 帳號']);return a;};})();
+webInit();
 
 /* ---------- screens & hub ---------- */
 const menuEl=$('menu'),gameEl=$('game'),ov=$('ov'),tabsEl=$('tabs'),bodyEl=$('tabBody');
@@ -7156,5 +7910,3 @@ requestAnimationFrame(frame);
 netInit();
 })();
 </script>
-
-</body></html>
